@@ -1,18 +1,29 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from typing import Optional, Sequence, Tuple, Union
 
+import numpy as np
 import torch
 from mmcv.cnn import build_conv_layer, build_upsample_layer
 from mmengine.structures import PixelData
 from torch import Tensor, nn
 
-from mmpose.evaluation.functional import pose_pck_accuracy
+from mmpose.evaluation.functional import keypoint_pck_accuracy
 from mmpose.models.utils.tta import flip_heatmaps
 from mmpose.registry import KEYPOINT_CODECS, MODELS
 from mmpose.utils.tensor_utils import to_numpy
 from mmpose.utils.typing import (ConfigType, Features, OptConfigType,
                                  OptSampleList, Predictions)
 from ..base_head import BaseHead
+
+
+def _heatmap_maximum_torch(heatmaps: Tensor) -> Tuple[Tensor, Tensor]:
+    B, K, H, W = heatmaps.shape
+    flat = heatmaps.detach().reshape(B * K, -1).float()
+    vals, idx = flat.max(dim=1)
+    locs = torch.stack((idx % W, idx // W), dim=-1).float()
+    locs[vals <= 0.] = -1
+    return locs.reshape(B, K, 2), vals.reshape(B, K)
+
 
 OptIntSeq = Optional[Sequence[int]]
 
@@ -306,10 +317,15 @@ class HeatmapHead(BaseHead):
 
         # calculate accuracy
         if train_cfg.get('compute_acc', True):
-            _, avg_acc, _ = pose_pck_accuracy(
-                output=to_numpy(pred_fields),
-                target=to_numpy(gt_heatmaps),
-                mask=to_numpy(keypoint_weights) > 0)
+            pred_locs, _ = _heatmap_maximum_torch(pred_fields)
+            gt_locs, _ = _heatmap_maximum_torch(gt_heatmaps)
+            N, _, H, W = gt_heatmaps.shape
+            _, avg_acc, _ = keypoint_pck_accuracy(
+                pred=to_numpy(pred_locs),
+                gt=to_numpy(gt_locs),
+                mask=to_numpy(keypoint_weights) > 0,
+                thr=0.05,
+                norm_factor=np.tile(np.array([[H, W]]), (N, 1)))
 
             acc_pose = torch.tensor(avg_acc, device=gt_heatmaps.device)
             losses.update(acc_pose=acc_pose)

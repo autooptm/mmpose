@@ -1,0 +1,363 @@
+diff --git a/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_hrnet-w32_8xb64-210e_coco-256x192.py b/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_hrnet-w32_8xb64-210e_coco-256x192.py
+index ea486d830a5d397f0e65958c832933a3de6fee6d..5cb6bd379cd7ce52d985d70e719e23150e3ad557 100644
+--- a/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_hrnet-w32_8xb64-210e_coco-256x192.py
++++ b/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_hrnet-w32_8xb64-210e_coco-256x192.py
+@@ -4,10 +4,15 @@ _base_ = ['../../../_base_/default_runtime.py']
+ train_cfg = dict(max_epochs=210, val_interval=10)
+ 
+ # optimizer
+-optim_wrapper = dict(optimizer=dict(
+-    type='Adam',
+-    lr=5e-4,
+-))
++#
++optim_wrapper = dict(
++    type='AmpOptimWrapper',
++    loss_scale='dynamic',
++    optimizer=dict(
++        type='Adam',
++        lr=5e-4,
++        fused=True,
++    ))
+ 
+ # learning policy
+ param_scheduler = [
+@@ -29,6 +34,13 @@ auto_scale_lr = dict(base_batch_size=512)
+ # hooks
+ default_hooks = dict(checkpoint=dict(save_best='coco/AP', rule='greater'))
+ 
++custom_hooks = [
++    dict(type='SyncBuffersHook'),
++    dict(type='OptHookA'),
++    dict(type='OptHookB', targets=['backbone'],
++         mode='reduce-overhead'),
++]
++
+ # codec settings
+ codec = dict(
+     type='MSRAHeatmap', input_size=(192, 256), heatmap_size=(48, 64), sigma=2)
+@@ -40,7 +52,10 @@ model = dict(
+         type='PoseDataPreprocessor',
+         mean=[123.675, 116.28, 103.53],
+         std=[58.395, 57.12, 57.375],
+-        bgr_to_rgb=True),
++        bgr_to_rgb=True,
++        opt_2=True,
++        non_blocking=True),
++    train_cfg=dict(compute_acc=False),
+     backbone=dict(
+         type='HRNet',
+         in_channels=3,
+@@ -113,7 +128,8 @@ val_pipeline = [
+ # data loaders
+ train_dataloader = dict(
+     batch_size=64,
+-    num_workers=2,
++    num_workers=8,
++    pin_memory=True,
+     persistent_workers=True,
+     sampler=dict(type='DefaultSampler', shuffle=True),
+     dataset=dict(
+diff --git a/mmpose/engine/hooks/__init__.py b/mmpose/engine/hooks/__init__.py
+index 2527a258bcf8888bae8b3c259d7a97b3fce541e4..367c716d9757fe79104aae34d02306e9992ab77a 100644
+--- a/mmpose/engine/hooks/__init__.py
++++ b/mmpose/engine/hooks/__init__.py
+@@ -1,5 +1,7 @@
+ # Copyright (c) OpenMMLab. All rights reserved.
+ from .badcase_hook import BadCaseAnalysisHook
++from .opt_hook_a import OptHookA
++from .opt_hook_b import OptHookB
+ from .ema_hook import ExpMomentumEMA
+ from .mode_switch_hooks import RTMOModeSwitchHook, YOLOXPoseModeSwitchHook
+ from .sync_norm_hook import SyncNormHook
+@@ -7,5 +9,6 @@ from .visualization_hook import PoseVisualizationHook
+ 
+ __all__ = [
+     'PoseVisualizationHook', 'ExpMomentumEMA', 'BadCaseAnalysisHook',
+-    'YOLOXPoseModeSwitchHook', 'SyncNormHook', 'RTMOModeSwitchHook'
++    'YOLOXPoseModeSwitchHook', 'SyncNormHook', 'RTMOModeSwitchHook',
++    'OptHookA', 'OptHookB'
+ ]
+diff --git a/mmpose/engine/hooks/opt_hook_a.py b/mmpose/engine/hooks/opt_hook_a.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4a9b66a154ee7ccc3babafa118136cd2e30fc2fb
+--- /dev/null
++++ b/mmpose/engine/hooks/opt_hook_a.py
+@@ -0,0 +1,15 @@
++import torch
++from mmengine.hooks import Hook
++
++from mmpose.registry import HOOKS
++
++
++@HOOKS.register_module()
++class OptHookA(Hook):
++
++    priority = 'NORMAL'
++
++    def before_train(self, runner) -> None:
++        runner.model.to(memory_format=torch.channels_last)
++        runner.logger.info(
++            'OptHookA: on')
+diff --git a/mmpose/engine/hooks/opt_hook_b.py b/mmpose/engine/hooks/opt_hook_b.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..71d12f111919bee3598b3b86737edbd60a9ccfb6
+--- /dev/null
++++ b/mmpose/engine/hooks/opt_hook_b.py
+@@ -0,0 +1,72 @@
++from typing import List, Optional
++
++import torch
++from mmengine.hooks import Hook
++from mmengine.model import is_model_wrapper
++
++from mmpose.registry import HOOKS
++
++
++@HOOKS.register_module()
++class OptHookB(Hook):
++
++    priority = 'LOW'
++
++    def __init__(self,
++                 targets: Optional[List[str]] = None,
++                 mode: Optional[str] = 'reduce-overhead',
++                 dynamic: bool = False,
++                 stock_eval: bool = True):
++        self.targets = list(targets) if targets else ['backbone']
++        self.mode = mode
++        self.dynamic = dynamic
++        self.stock_eval = stock_eval
++        self._stock = {}
++        self._wrapped = {}
++
++    @staticmethod
++    def _bare(model):
++        return model.module if is_model_wrapper(model) else model
++
++    def before_train(self, runner) -> None:
++        model = self._bare(runner.model)
++        for name in self.targets:
++            sub = getattr(model, name, None)
++            if sub is None:
++                raise AttributeError(
++                    f'OptHookB: model has no submodule {name!r}')
++            self._stock[name] = sub
++            setattr(
++                model, name,
++                torch.compile(sub, mode=self.mode, dynamic=self.dynamic))
++            wrapped = getattr(model, name)
++            assert getattr(wrapped, '_orig_mod', None) is not None, (
++                f'OptHookB: could not wrap {name!r}')
++            runner.logger.info(
++                f'OptHookB: wrapped {name} '
++                f'(mode={self.mode}, dynamic={self.dynamic}, '
++                f'stock_eval={self.stock_eval})')
++
++    def _use_stock(self, runner, on: bool) -> None:
++        if not self.stock_eval or not self._stock:
++            return
++        model = self._bare(runner.model)
++        for name, eager in self._stock.items():
++            current = getattr(model, name)
++            if on:
++                self._wrapped[name] = current
++                setattr(model, name, eager)
++            else:
++                setattr(model, name, self._wrapped[name])
++
++    def before_val_epoch(self, runner) -> None:
++        self._use_stock(runner, True)
++
++    def after_val_epoch(self, runner, metrics=None) -> None:
++        self._use_stock(runner, False)
++
++    def before_test_epoch(self, runner) -> None:
++        self._use_stock(runner, True)
++
++    def after_test_epoch(self, runner, metrics=None) -> None:
++        self._use_stock(runner, False)
+diff --git a/mmpose/models/data_preprocessors/data_preprocessor.py b/mmpose/models/data_preprocessors/data_preprocessor.py
+index 9442d0ed50bdf0e9ca219e496619c1880777bda4..873255666c12b35eb498a585bb55412d93e954b7 100644
+--- a/mmpose/models/data_preprocessors/data_preprocessor.py
++++ b/mmpose/models/data_preprocessors/data_preprocessor.py
+@@ -1,4 +1,5 @@
+ # Copyright (c) OpenMMLab. All rights reserved.
++import os
+ from typing import List, Optional, Sequence, Union
+ 
+ import numpy as np
+@@ -58,7 +59,9 @@ class PoseDataPreprocessor(ImgDataPreprocessor):
+                  bgr_to_rgb: bool = False,
+                  rgb_to_bgr: bool = False,
+                  non_blocking: Optional[bool] = False,
+-                 batch_augments: Optional[List[dict]] = None):
++                 batch_augments: Optional[List[dict]] = None,
++                 opt_2: bool = False):
++        self.opt_2 = opt_2
+         super().__init__(
+             mean=mean,
+             std=std,
+@@ -86,7 +89,7 @@ class PoseDataPreprocessor(ImgDataPreprocessor):
+             dict: Data in the same format as the model input.
+         """
+         batch_pad_shape = self._get_pad_shape(data)
+-        data = super().forward(data=data, training=training)
++        data = self._opt_forward(data, training)
+         inputs, data_samples = data['inputs'], data['data_samples']
+ 
+         # update metainfo since the image shape might change
+@@ -104,6 +107,26 @@ class PoseDataPreprocessor(ImgDataPreprocessor):
+ 
+         return {'inputs': inputs, 'data_samples': data_samples}
+ 
++    def _opt_forward(self, data: dict, training: bool) -> dict:
++        inputs = data['inputs']
++        if (not is_seq_of(inputs, torch.Tensor) or len(inputs) < 2
++                or self.pad_size_divisor != 1
++                or any(x.shape != inputs[0].shape for x in inputs)):
++            return super().forward(data=data, training=training)
++
++        data = self.cast_data({k: v for k, v in data.items() if k != 'inputs'})
++        batch = torch.stack(inputs).to(
++            self.device, non_blocking=getattr(self, '_non_blocking', False))
++        if self._channel_conversion:
++            batch = batch[:, [2, 1, 0], ...]
++        batch = batch.float()
++        if self._enable_normalize:
++            batch = (batch - self.mean) / self.std
++        if self.opt_2 or os.environ.get('AO_OPT_2', '1') != '0':
++            batch = batch.contiguous(memory_format=torch.channels_last)
++        data['inputs'] = batch
++        return data
++
+     def _get_pad_shape(self, data: dict) -> List[tuple]:
+         """Get the pad_shape of each image based on data and
+         pad_size_divisor."""
+diff --git a/mmpose/models/heads/heatmap_heads/heatmap_head.py b/mmpose/models/heads/heatmap_heads/heatmap_head.py
+index ccb10fcf546243a7b3f013f79806a91d180f1da5..b1618542a2d51da3c69c4035cf2d6d2a7cf53722 100644
+--- a/mmpose/models/heads/heatmap_heads/heatmap_head.py
++++ b/mmpose/models/heads/heatmap_heads/heatmap_head.py
+@@ -1,12 +1,13 @@
+ # Copyright (c) OpenMMLab. All rights reserved.
+ from typing import Optional, Sequence, Tuple, Union
+ 
++import numpy as np
+ import torch
+ from mmcv.cnn import build_conv_layer, build_upsample_layer
+ from mmengine.structures import PixelData
+ from torch import Tensor, nn
+ 
+-from mmpose.evaluation.functional import pose_pck_accuracy
++from mmpose.evaluation.functional import keypoint_pck_accuracy
+ from mmpose.models.utils.tta import flip_heatmaps
+ from mmpose.registry import KEYPOINT_CODECS, MODELS
+ from mmpose.utils.tensor_utils import to_numpy
+@@ -14,6 +15,16 @@ from mmpose.utils.typing import (ConfigType, Features, OptConfigType,
+                                  OptSampleList, Predictions)
+ from ..base_head import BaseHead
+ 
++
++def _heatmap_maximum_torch(heatmaps: Tensor) -> Tuple[Tensor, Tensor]:
++    B, K, H, W = heatmaps.shape
++    flat = heatmaps.detach().reshape(B * K, -1).float()
++    vals, idx = flat.max(dim=1)
++    locs = torch.stack((idx % W, idx // W), dim=-1).float()
++    locs[vals <= 0.] = -1
++    return locs.reshape(B, K, 2), vals.reshape(B, K)
++
++
+ OptIntSeq = Optional[Sequence[int]]
+ 
+ 
+@@ -306,10 +317,15 @@ class HeatmapHead(BaseHead):
+ 
+         # calculate accuracy
+         if train_cfg.get('compute_acc', True):
+-            _, avg_acc, _ = pose_pck_accuracy(
+-                output=to_numpy(pred_fields),
+-                target=to_numpy(gt_heatmaps),
+-                mask=to_numpy(keypoint_weights) > 0)
++            pred_locs, _ = _heatmap_maximum_torch(pred_fields)
++            gt_locs, _ = _heatmap_maximum_torch(gt_heatmaps)
++            N, _, H, W = gt_heatmaps.shape
++            _, avg_acc, _ = keypoint_pck_accuracy(
++                pred=to_numpy(pred_locs),
++                gt=to_numpy(gt_locs),
++                mask=to_numpy(keypoint_weights) > 0,
++                thr=0.05,
++                norm_factor=np.tile(np.array([[H, W]]), (N, 1)))
+ 
+             acc_pose = torch.tensor(avg_acc, device=gt_heatmaps.device)
+             losses.update(acc_pose=acc_pose)
+diff --git a/tools/train.py b/tools/train.py
+index 84eec2d577f2cdc026c6d0fa1235bdf0d8a843c9..b160eb98f30e5b00a534c174f4befdcfee487e76 100644
+--- a/tools/train.py
++++ b/tools/train.py
+@@ -137,6 +137,52 @@ def merge_args(cfg, args):
+     return cfg
+ 
+ 
++def _autooptm_tune(cfg):
++    import os
++
++    if os.environ.get('AO_OPT_5', 'auto') != '0' and cfg.get(
++            'launcher', 'none') == 'none' and 'train_dataloader' in cfg:
++        want = os.environ.get('AO_OPT_5', 'auto')
++        if want == 'auto':
++            try:
++                have = len(os.sched_getaffinity(0))
++            except AttributeError:
++                have = os.cpu_count() or 4
++            want = max(4, min(8, have // 2 - 2))
++        cfg.train_dataloader.num_workers = int(want)
++        cfg.train_dataloader.persistent_workers = True
++        cfg.train_dataloader.prefetch_factor = 4
++
++    if os.environ.get('AO_OPT_3', '0') != '0' and 'env_cfg' in cfg:
++        cfg.env_cfg.cudnn_benchmark = True
++
++    opt_dt = os.environ.get('AO_OPT_1', '').strip()
++    if opt_dt:
++        cfg.optim_wrapper.type = 'AmpOptimWrapper'
++        cfg.optim_wrapper.setdefault('dtype', opt_dt)
++        if opt_dt == 'float16':
++            cfg.optim_wrapper.setdefault('loss_scale', 'dynamic')
++
++    if os.environ.get('AO_OPT_4', '1') != '0':
++        import torch
++        opt = cfg.get('optim_wrapper', {}).get('optimizer', {})
++        if (torch.cuda.is_available()
++                and cfg.get('optim_wrapper', {}).get('type') != 'AmpOptimWrapper'
++                and opt.get('type') in ('Adam', 'AdamW')):
++            opt.setdefault('fused', True)
++
++    return cfg
++
++
++def _autooptm_tune_model(runner):
++    import os
++
++    import torch
++
++    if os.environ.get('AO_OPT_2', '1') != '0' and torch.cuda.is_available():
++        runner.model.to(memory_format=torch.channels_last)
++
++
+ def main():
+     args = parse_args()
+ 
+@@ -151,9 +197,13 @@ def main():
+         cfg.model.setdefault('data_preprocessor',
+                              cfg.get('preprocess_cfg', {}))
+ 
++    cfg = _autooptm_tune(cfg)
++
+     # build the runner from config
+     runner = Runner.from_cfg(cfg)
+ 
++    _autooptm_tune_model(runner)
++
+     # start training
+     runner.train()
+ 

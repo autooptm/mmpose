@@ -137,6 +137,52 @@ def merge_args(cfg, args):
     return cfg
 
 
+def _autooptm_tune(cfg):
+    import os
+
+    if os.environ.get('AO_OPT_5', 'auto') != '0' and cfg.get(
+            'launcher', 'none') == 'none' and 'train_dataloader' in cfg:
+        want = os.environ.get('AO_OPT_5', 'auto')
+        if want == 'auto':
+            try:
+                have = len(os.sched_getaffinity(0))
+            except AttributeError:
+                have = os.cpu_count() or 4
+            want = max(4, min(8, have // 2 - 2))
+        cfg.train_dataloader.num_workers = int(want)
+        cfg.train_dataloader.persistent_workers = True
+        cfg.train_dataloader.prefetch_factor = 4
+
+    if os.environ.get('AO_OPT_3', '0') != '0' and 'env_cfg' in cfg:
+        cfg.env_cfg.cudnn_benchmark = True
+
+    opt_dt = os.environ.get('AO_OPT_1', '').strip()
+    if opt_dt:
+        cfg.optim_wrapper.type = 'AmpOptimWrapper'
+        cfg.optim_wrapper.setdefault('dtype', opt_dt)
+        if opt_dt == 'float16':
+            cfg.optim_wrapper.setdefault('loss_scale', 'dynamic')
+
+    if os.environ.get('AO_OPT_4', '1') != '0':
+        import torch
+        opt = cfg.get('optim_wrapper', {}).get('optimizer', {})
+        if (torch.cuda.is_available()
+                and cfg.get('optim_wrapper', {}).get('type') != 'AmpOptimWrapper'
+                and opt.get('type') in ('Adam', 'AdamW')):
+            opt.setdefault('fused', True)
+
+    return cfg
+
+
+def _autooptm_tune_model(runner):
+    import os
+
+    import torch
+
+    if os.environ.get('AO_OPT_2', '1') != '0' and torch.cuda.is_available():
+        runner.model.to(memory_format=torch.channels_last)
+
+
 def main():
     args = parse_args()
 
@@ -151,8 +197,12 @@ def main():
         cfg.model.setdefault('data_preprocessor',
                              cfg.get('preprocess_cfg', {}))
 
+    cfg = _autooptm_tune(cfg)
+
     # build the runner from config
     runner = Runner.from_cfg(cfg)
+
+    _autooptm_tune_model(runner)
 
     # start training
     runner.train()

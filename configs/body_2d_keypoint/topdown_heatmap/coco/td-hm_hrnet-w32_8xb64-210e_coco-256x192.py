@@ -4,10 +4,15 @@ _base_ = ['../../../_base_/default_runtime.py']
 train_cfg = dict(max_epochs=210, val_interval=10)
 
 # optimizer
-optim_wrapper = dict(optimizer=dict(
-    type='Adam',
-    lr=5e-4,
-))
+#
+optim_wrapper = dict(
+    type='AmpOptimWrapper',
+    loss_scale='dynamic',
+    optimizer=dict(
+        type='Adam',
+        lr=5e-4,
+        fused=True,
+    ))
 
 # learning policy
 param_scheduler = [
@@ -29,6 +34,13 @@ auto_scale_lr = dict(base_batch_size=512)
 # hooks
 default_hooks = dict(checkpoint=dict(save_best='coco/AP', rule='greater'))
 
+custom_hooks = [
+    dict(type='SyncBuffersHook'),
+    dict(type='OptHookA'),
+    dict(type='OptHookB', targets=['backbone'],
+         mode='reduce-overhead'),
+]
+
 # codec settings
 codec = dict(
     type='MSRAHeatmap', input_size=(192, 256), heatmap_size=(48, 64), sigma=2)
@@ -40,7 +52,10 @@ model = dict(
         type='PoseDataPreprocessor',
         mean=[123.675, 116.28, 103.53],
         std=[58.395, 57.12, 57.375],
-        bgr_to_rgb=True),
+        bgr_to_rgb=True,
+        opt_2=True,
+        non_blocking=True),
+    train_cfg=dict(compute_acc=False),
     backbone=dict(
         type='HRNet',
         in_channels=3,
@@ -113,7 +128,8 @@ val_pipeline = [
 # data loaders
 train_dataloader = dict(
     batch_size=64,
-    num_workers=2,
+    num_workers=8,
+    pin_memory=True,
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
     dataset=dict(

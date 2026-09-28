@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import os
 from typing import List, Optional, Sequence, Union
 
 import numpy as np
@@ -58,7 +59,9 @@ class PoseDataPreprocessor(ImgDataPreprocessor):
                  bgr_to_rgb: bool = False,
                  rgb_to_bgr: bool = False,
                  non_blocking: Optional[bool] = False,
-                 batch_augments: Optional[List[dict]] = None):
+                 batch_augments: Optional[List[dict]] = None,
+                 opt_2: bool = False):
+        self.opt_2 = opt_2
         super().__init__(
             mean=mean,
             std=std,
@@ -86,7 +89,7 @@ class PoseDataPreprocessor(ImgDataPreprocessor):
             dict: Data in the same format as the model input.
         """
         batch_pad_shape = self._get_pad_shape(data)
-        data = super().forward(data=data, training=training)
+        data = self._opt_forward(data, training)
         inputs, data_samples = data['inputs'], data['data_samples']
 
         # update metainfo since the image shape might change
@@ -103,6 +106,26 @@ class PoseDataPreprocessor(ImgDataPreprocessor):
                 inputs, data_samples = batch_aug(inputs, data_samples)
 
         return {'inputs': inputs, 'data_samples': data_samples}
+
+    def _opt_forward(self, data: dict, training: bool) -> dict:
+        inputs = data['inputs']
+        if (not is_seq_of(inputs, torch.Tensor) or len(inputs) < 2
+                or self.pad_size_divisor != 1
+                or any(x.shape != inputs[0].shape for x in inputs)):
+            return super().forward(data=data, training=training)
+
+        data = self.cast_data({k: v for k, v in data.items() if k != 'inputs'})
+        batch = torch.stack(inputs).to(
+            self.device, non_blocking=getattr(self, '_non_blocking', False))
+        if self._channel_conversion:
+            batch = batch[:, [2, 1, 0], ...]
+        batch = batch.float()
+        if self._enable_normalize:
+            batch = (batch - self.mean) / self.std
+        if self.opt_2 or os.environ.get('AO_OPT_2', '1') != '0':
+            batch = batch.contiguous(memory_format=torch.channels_last)
+        data['inputs'] = batch
+        return data
 
     def _get_pad_shape(self, data: dict) -> List[tuple]:
         """Get the pad_shape of each image based on data and

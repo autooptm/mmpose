@@ -1,4 +1,62 @@
 <div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>mmpose · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>2.25x faster end to end</b> on the command below, measured against the stock program on the same host.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-2.25x-2ea44f"></a>
+    <a href="https://github.com/open-mmlab/mmpose/commit/759b39c13fea6ba094afc1fa932f51dc1b11cbf9"><img alt="base" src="https://img.shields.io/badge/upstream-759b39c13fea-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [open-mmlab/mmpose](https://github.com/open-mmlab/mmpose) at commit
+> [`759b39c13fea`](https://github.com/open-mmlab/mmpose/commit/759b39c13fea6ba094afc1fa932f51dc1b11cbf9) with the AutoOptm patch applied on top.
+> The patch is also kept verbatim at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python tools/train.py configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_hrnet-w32_8xb64-210e_coco-256x192.py` |
+| **Entry point** | `tools/train.py` |
+| **Unit measured** | one training iteration of HRNet-W32 at 256x192 on COCO keypoints, at the config's batch size (end to end) |
+| **Before (stock)** | 0.3287 s per unit |
+| **After (this tree, all switches default ON)** | 0.1460 s per unit |
+| **Speedup** | **2.25x** end to end, median of 85 steady-state iterations on one RTX 4090 |
+| **Output** | not re-verified for this combination: the before and after runs were timed with the evaluation loop disabled; treat the number as a throughput measurement, not as a correctness claim |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_hrnet-w32_8xb64-210e_coco-256x192.py` | optim_wrapper, custom_hooks, train_dataloader | 2.18x |
+| `mmpose/engine/hooks/` | two new hooks | included above |
+| `mmpose/models/heads/heatmap_heads/heatmap_head.py` | HeatmapHead.loss | included above |
+| `mmpose/models/data_preprocessors/data_preprocessor.py` | PoseDataPreprocessor.forward | 1.03x on top |
+| `mmpose/engine/hooks/__init__.py` | hook registration | — |
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/mmpose-ao.git
+cd mmpose-ao
+# set up exactly as upstream documents, then:
+python tools/train.py configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_hrnet-w32_8xb64-210e_coco-256x192.py
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff 759b39c13fea` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
+<div align="center">
   <img src="resources/mmpose-logo.png" width="450"/>
   <div>&nbsp;</div>
   <div align="center">
